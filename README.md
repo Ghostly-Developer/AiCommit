@@ -139,7 +139,8 @@ Cost estimates assume paid-tier pricing; free tiers cost $0.
 
 ## Development
 
-See [CODE_GUIDE.md](CODE_GUIDE.md) for a walkthrough of every module and function.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the component overview, flow diagrams and pseudocode, and
+[CODE_GUIDE.md](CODE_GUIDE.md) for a walkthrough of every module and function.
 
 ```bash
 pytest
