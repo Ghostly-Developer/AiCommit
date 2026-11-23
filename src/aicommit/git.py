@@ -58,9 +58,48 @@ def staged_files() -> str:
     return _run(["diff", "--cached", "--name-status"]).strip()
 
 
+def _excludes() -> list[str]:
+    return [f":(exclude,glob)**/{p}" for p in EXCLUDED_PATHS]
+
+
 def staged_diff() -> str:
-    excludes = [f":(exclude,glob)**/{p}" for p in EXCLUDED_PATHS]
-    return _run(["diff", "--cached", "--no-color", "--no-ext-diff", "--", ".", *excludes])
+    return _run(["diff", "--cached", "--no-color", "--no-ext-diff", "--", ".", *_excludes()])
+
+
+# --- pull request helpers ----------------------------------------------------
+
+def _ref_exists(ref: str) -> bool:
+    return bool(_run(["rev-parse", "--verify", "--quiet", ref], check=False).strip())
+
+
+def default_base_branch() -> str:
+    """Best guess at the branch a PR targets: origin's default branch, else main/master."""
+    origin_head = _run(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], check=False).strip()
+    if origin_head:
+        return origin_head
+    for candidate in ("origin/main", "origin/master", "main", "master"):
+        if _ref_exists(candidate):
+            return candidate
+    raise GitError("Could not detect a base branch; pass one with --base")
+
+
+def ensure_ref(ref: str) -> None:
+    if not _ref_exists(ref):
+        raise GitError(f"Unknown branch or ref: {ref}")
+
+
+def branch_files(base: str) -> str:
+    # `base...HEAD` = changes on this branch since it forked from base.
+    return _run(["diff", "--name-status", f"{base}...HEAD"]).strip()
+
+
+def branch_diff(base: str) -> str:
+    return _run(["diff", "--no-color", "--no-ext-diff", f"{base}...HEAD", "--", ".", *_excludes()])
+
+
+def branch_commits(base: str) -> list[str]:
+    out = _run(["log", "--reverse", "--pretty=format:%s", f"{base}..HEAD"])
+    return [line for line in out.splitlines() if line.strip()]
 
 
 def recent_subjects(n: int = 10) -> list[str]:

@@ -9,7 +9,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 DEFAULT_MODEL = "gemini-3.8-flash"
-DEFAULT_MAX_DIFF_CHARS = 20_000
+# Cap on input tokens per request (system prompt + diff). A cost guard, well under the
+# model's real context window; large diffs are trimmed to fit.
+DEFAULT_MAX_INPUT_TOKENS = 16_000
 
 # Global, per-user config file so the key works in every repository.
 USER_ENV_FILE = Path.home() / ".aicommit.env"
@@ -23,7 +25,7 @@ class ConfigError(Exception):
 class Config:
     api_key: str
     model: str
-    max_diff_chars: int
+    max_input_tokens: int
 
 
 def load_config(model_override: str | None = None) -> Config:
@@ -40,14 +42,16 @@ def load_config(model_override: str | None = None) -> Config:
             "  - a .env file in the current directory"
         )
 
-    max_chars_raw = os.getenv("AICOMMIT_MAX_DIFF_CHARS", str(DEFAULT_MAX_DIFF_CHARS))
+    raw = os.getenv("AICOMMIT_MAX_INPUT_TOKENS", str(DEFAULT_MAX_INPUT_TOKENS))
     try:
-        max_diff_chars = int(max_chars_raw)
+        max_input_tokens = int(raw)
     except ValueError:
-        raise ConfigError(f"AICOMMIT_MAX_DIFF_CHARS must be an integer, got {max_chars_raw!r}")
+        raise ConfigError(f"AICOMMIT_MAX_INPUT_TOKENS must be an integer, got {raw!r}")
+    if max_input_tokens < 1_000:
+        raise ConfigError("AICOMMIT_MAX_INPUT_TOKENS must be at least 1000")
 
     return Config(
         api_key=api_key,
         model=model_override or os.getenv("AICOMMIT_MODEL") or DEFAULT_MODEL,
-        max_diff_chars=max_diff_chars,
+        max_input_tokens=max_input_tokens,
     )
