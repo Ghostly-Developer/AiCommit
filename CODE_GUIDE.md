@@ -75,7 +75,7 @@ AiCommit/
     └── test_usage.py       # cost maths
 ```
 
-Only `ai.py` imports Google's SDK, and only the `Gemini` class in it. You could swap providers by writing another class with the same two methods.
+Only `ai.py` imports the AI SDKs: Google's inside the `Gemini` class and Groq's inside the `Groq` class. Both have the same two methods, so the rest of the code doesn't care which one is answering. That's what makes the fallback cheap to add.
 
 ---
 
@@ -89,14 +89,18 @@ Only `ai.py` imports Google's SDK, and only the `Gemini` class in it. You could 
    ├─ git.ensure_repo(), config.load_config()
    ├─ commit mode: git.staged_files() / git.staged_diff()
    │  PR mode:     git.branch_files(base) / git.branch_diff(base) / git.branch_commits(base)
+   ├─ cli.build_llms()           → [Gemini, Groq], limited to providers that have a key
    ├─ ai.fit_prompt()            → build prompt, count tokens, trim the diff until it fits
    │
    └─ loop:
-        ├─ ai.generate()
-        │    ├─ Gemini.stream()      → streaming HTTPS call, JSON-schema constrained
-        │    │    (each chunk is echoed to the terminal as it arrives)
-        │    ├─ schema.parse()       → json.loads + Pydantic validation
-        │    └─ invalid? add the error to the prompt and try again (up to 3 attempts)
+        ├─ ai.generate_with_fallback()     → for each provider in order:
+        │  └─ ai.generate()
+        │       ├─ llm.stream()        → Gemini: streaming HTTPS call, JSON-schema constrained
+        │       │                        Groq: one (non-streaming) call, strict JSON schema
+        │       │    (each chunk is echoed to the terminal as it arrives)
+        │       ├─ schema.parse()       → json.loads + Pydantic validation
+        │       └─ invalid? add the error to the prompt and try again (up to 3 attempts)
+        │     AIError (API error, or 3 invalid replies) → warn, try the next provider
         ├─ print token usage + estimated cost
         ├─ --json → print the JSON, exit
         ├─ --pr / --dry-run → print the rendered text, exit
@@ -115,6 +119,7 @@ Only `ai.py` imports Google's SDK, and only the `Gemini` class in it. You could 
 
 - **`dependencies`**
   - `google-genai>=1.30`: Google's official Python SDK for Gemini. 1.30+ is needed for `response_json_schema`.
+  - `groq`: Groq's official SDK (an OpenAI-style chat API), used for the fallback.
   - `pydantic`: defines the output schema as a Python class and validates data against it.
   - `python-dotenv`: reads `KEY=value` lines from `.env` files into environment variables.
 - **`[project.scripts] aicommit = "aicommit.cli:main"`**: when installed, pip creates an `aicommit` executable that calls `main()` in `cli.py`.
@@ -122,15 +127,16 @@ Only `ai.py` imports Google's SDK, and only the `Gemini` class in it. You could 
 
 ### 5.2 [config.py](src/aicommit/config.py): settings
 
-- `DEFAULT_MODEL = "gemini-3.8-flash"`: the model used if you don't choose one.
+- `DEFAULT_MODEL = "gemini-3.8-flash"`: the Gemini model used if you don't choose one.
+- `DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"`: the Groq fallback model. It supports Groq's *strict* JSON-schema mode. Groq lists it as a preview model; `openai/gpt-oss-20b` is a much cheaper strict-mode alternative.
 - `DEFAULT_MAX_INPUT_TOKENS = 16_000`: the per-request input budget (system prompt + diff).
 - `USER_ENV_FILE`: `~/.aicommit.env`, a per-user file so one key works in every repo.
 
-**`load_config(model_override=None) -> Config`**
+**`load_config(model_override=None, groq_model_override=None) -> Config`**
 1. Loads `./.env` then `~/.aicommit.env`. `override=False` means already-set values win, so the priority is **real environment variable → `./.env` → `~/.aicommit.env`**.
-2. Reads `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), raising `ConfigError` with setup instructions if neither is set.
+2. Reads `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) and `GROQ_API_KEY`. Each is optional, but at least one is required, otherwise it raises `ConfigError` with setup instructions.
 3. Parses `AICOMMIT_MAX_INPUT_TOKENS` (must be an integer ≥ 1000).
-4. Picks the model: `--model` flag, then `AICOMMIT_MODEL`, then the default.
+4. Picks the models: `--model` / `AICOMMIT_MODEL` / default for Gemini, and `--groq-model` / `AICOMMIT_GROQ_MODEL` / default for Groq.
 
 ### 5.3 [git.py](src/aicommit/git.py): talking to git
 
@@ -175,11 +181,13 @@ Rendering helpers turn the data into text: `subject` (`"feat: add x"`), `as_comm
 3. `GeneratedMessage.model_validate` checks the shape and types.
 4. Any failure raises `OutputInvalid` with a readable reason such as `JSON does not match schema (type: Input should be 'feat', 'fix' or 'refactor')`. That reason is shown to you **and fed back to the model** on retry.
 
+**`portable_json_schema()`**: the same schema minus the `title`, `minLength` and `maxLength` *keywords*, which Groq's strict mode doesn't document support for. (The *field* called `title` stays.) This only loosens what the API enforces: `parse()` still checks lengths locally.
+
 **Why validate if the API already enforces the schema?** API-side schema support is best-effort: it can differ by model, some JSON Schema keywords may be ignored, and a reply can be cut off mid-JSON (e.g. a safety block or token limit). Checking in your own code turns "usually valid" into "valid every time, or a clear error".
 
 ### 5.5 [usage.py](src/aicommit/usage.py): tokens and cost
 
-- **`PRICES`**: USD per 1M tokens `(input, output)` for known models. Prices change, so treat this as a convenience; `AICOMMIT_PRICE_INPUT` / `AICOMMIT_PRICE_OUTPUT` override it. The `gemini-3.8-flash` entry is an introductory rate that Google has said will double on 2027-01-01.
+- **`PRICES`**: USD per 1M tokens `(input, output)` for known Gemini and Groq models. Prices change, so treat this as a convenience. Env vars override it per provider: `AICOMMIT_PRICE_INPUT/OUTPUT` for Gemini and `AICOMMIT_GROQ_PRICE_INPUT/OUTPUT` for Groq. Each client class carries its prefix as `price_env`, so a Groq call is never priced with Gemini's override. The `gemini-3.8-flash` entry is an introductory rate that Google has said will double on 2027-01-01.
 - **`Usage`**: input, output and thinking token counts plus a call count. `from_metadata()` reads Gemini's `usage_metadata` (`prompt_token_count`, `candidates_token_count`, `thoughts_token_count`). `+` adds two usages, so retries are summed.
 - **`estimate_cost()`**: `input × input_price + (output + thinking) × output_price`, per million. Unknown model → `None`.
 - **`format_usage()`**: the line printed after each call, e.g. `tokens: 2,310 in / 84 out / 412 thinking | est. cost $0.00360`.
@@ -202,7 +210,9 @@ Watch the thinking count: on "thinking" models it's often bigger than the visibl
 
 It returns the prompt, its token count, whether that count was exact or estimated, and whether the diff was truncated. The CLI prints this as `prompt: 3,120 tokens (limit 16,000)`.
 
-**`class LLM(Protocol)`**: the two methods the rest of the code needs from a model: `count_tokens(text)` and `stream(system, prompt, temperature)`. Tests pass a fake object with these methods, so no network is needed.
+**`class LLM(Protocol)`**: what the rest of the code needs from a model: the attributes `provider`, `model` and `price_env`, plus two methods, `count_tokens(text)` and `stream(system, prompt, temperature)`. Tests pass a fake object with these, so no network is needed.
+
+**`class AIError`**: raised for any model failure. It carries `usage`, the tokens already spent before the failure, so the CLI can still report what a failed provider cost.
 
 **`class Gemini`**: the real implementation.
 ```python
@@ -216,8 +226,27 @@ for chunk in client.models.generate_content_stream(model=..., contents=prompt, c
     yield chunk.text, usage_from(chunk.usage_metadata)
 ```
 - `generate_content_stream` returns an iterator. Each chunk carries the next bit of text, and usage metadata arrives along the way (we keep the latest report).
-- API errors (bad key, quota, unknown model) become `AIError("Gemini API error (400): ...")`.
+- API errors (bad key, quota, unknown model) become `AIError("Gemini API error (400): ...")`. Any other exception (e.g. no network) becomes `AIError("Gemini request failed: ...")`. Every failure has the same type, which is what lets the fallback catch it.
 - The SDK is imported inside the methods so `aicommit --help` starts instantly.
+
+**`class Groq`**: the fallback provider, with the same interface:
+```python
+client.chat.completions.create(
+    model="qwen/qwen3.8-27b",
+    messages=[{"role": "system", "content": system},   # OpenAI-style: the system prompt
+              {"role": "user", "content": prompt}],     # is just the first message
+    temperature=temperature,
+    response_format={"type": "json_schema", "json_schema": {
+        "name": "generated_message",
+        "strict": True,                                 # constrained decoding
+        "schema": schema.portable_json_schema()}},
+)
+```
+- **Strict mode** (constrained decoding, which can't produce off-schema JSON) is only available on some Groq models, listed in `GROQ_STRICT_MODELS`. Other models get best-effort mode (`strict: False`). Local validation catches anything that slips through either way.
+- **No streaming:** Groq doesn't support streaming together with structured outputs, so `stream()` makes one normal request and yields the whole reply as a single chunk. Because the interface is the same, `generate()` doesn't need to know.
+- **`count_tokens`:** Groq has no counting endpoint, so it estimates ~3 characters per token.
+- **Usage:** Groq's `completion_tokens` *includes* reasoning tokens. `_groq_usage()` splits them out so thinking is shown separately, just like Gemini's.
+- `groq.APIStatusError` / `groq.APIError` become `AIError`. The SDK itself already retries 429/5xx responses twice before giving up.
 
 **`generate(llm, system, prompt, temperature, on_chunk, on_retry, max_attempts=3) -> Result`**: the **validate-and-retry loop**:
 1. Stream the reply, passing each chunk to `on_chunk` (the CLI prints it dimmed) and collecting it.
@@ -226,16 +255,22 @@ for chunk in client.models.generate_content_stream(model=..., contents=prompt, c
 4. Invalid or empty → call `on_retry`, then re-send the **original prompt plus the rejection reason** ("Your previous reply was rejected: ... Reply again with ONLY a JSON object matching the schema."). Telling the model *what* was wrong fixes it far more often than just asking again.
 5. After `max_attempts` failures, raise `AIError`. The tool never prints or commits unvalidated output.
 
+**`generate_with_fallback(llms, ..., on_start, on_fallback) -> Result`**: tries each provider in order with `generate()`.
+- Success → return immediately. The `Result` records which `provider`/`model` answered, so usage and cost are priced correctly.
+- `AIError` (API error, network failure, or 3 invalid replies) → call `on_fallback(failed, error, next)` and try the next provider. Validation retries happen *within* a provider first; switching providers is the last resort.
+- If every provider fails, it raises one `AIError` listing each provider's error. With a single provider, the original error is raised unchanged.
+
 ### 5.7 [cli.py](src/aicommit/cli.py): the command
 
 - **Output streams**: status, streaming text, usage and errors go to **stderr**; the message (or JSON) goes to **stdout**. So `aicommit --json > msg.json` captures pure JSON while you still see progress.
 - **Colors** are off when the stream isn't a terminal or `NO_COLOR` is set.
 - **`parse_args()`** defines the flags (see README) and rejects nonsensical combinations, e.g. `--pr` with `-y` (PR mode never commits) or `--base` without `--pr`.
-- **`_streamer(enabled)`** returns the `on_chunk` callback that echoes chunks to stderr. Streaming is on when stderr is a terminal, unless `--no-stream`.
+- **`Streamer`** echoes chunks to stderr and tracks whether a line was left open, so retry/fallback warnings start on a fresh line. Streaming is on when stderr is a terminal, unless `--no-stream`.
+- **`build_llms(config, provider, fallback)`** builds the ordered provider list: `--provider` first (default `gemini`), then the other. Providers without a key are skipped, and `--no-fallback` keeps only the first. Asking for `--provider groq` without `GROQ_API_KEY` is an error rather than a silent switch.
 - **`main()`**:
   1. Collects files/diff/context for commit mode or PR mode and picks the matching system prompt. `build` is a small closure that turns a (possibly trimmed) diff into the full user prompt; `fit_prompt` calls it repeatedly while trimming.
-  2. Creates the `Gemini` client and fits the prompt to the token budget.
-  3. Generates, prints usage, then outputs JSON (`--json`), the PR markdown (`--pr`), or the commit message with the y/e/r/n prompt.
+  2. Builds the provider list (printed as `providers: gemini (...) -> groq (...)`) and fits the prompt to the token budget using the first provider's token counter.
+  3. Generates with fallback (printing a warning, plus the failed provider's usage, when it switches), prints usage, then outputs JSON (`--json`), the PR markdown (`--pr`), or the commit message with the y/e/r/n prompt.
   4. "Regenerate" raises temperature by 0.3 (cap 1.5): with an identical prompt, more randomness is what produces a different answer.
   5. `GitError`, `ConfigError` and `AIError` are caught in one place and printed as `error: ...` without a traceback. Exit codes: 0 success, 1 error/aborted, 130 Ctrl+C.
 
@@ -247,6 +282,8 @@ for chunk in client.models.generate_content_stream(model=..., contents=prompt, c
 
 - **[test_schema.py](tests/test_schema.py)**: valid JSON parses; each allowed type is accepted; fences and `feat:` title prefixes are cleaned; and a table of **invalid** replies (not JSON, a list, wrong type, empty/long/multi-line title, missing summary, extra key) are all rejected with the right reason.
 - **[test_ai.py](tests/test_ai.py)**: a `FakeLLM` replays canned replies in 5-char chunks. Tests check that streaming delivers every chunk, that invalid → invalid → valid succeeds on attempt 3 **with the error fed back into the prompt**, that usage sums across retries, that it gives up after `max_attempts`, and that `fit_prompt` trims a code-heavy diff under the limit while keeping every file.
+- **[test_ai.py](tests/test_ai.py)**, fallback: a Gemini API error falls back to Groq; three invalid Gemini replies fall back too, and still report Gemini's spent usage; Groq isn't called when Gemini succeeds; when all providers fail, every error is listed. A fake Groq SDK client checks the request shape (strict schema, system message) and the reasoning-token split.
+- **[test_cli.py](tests/test_cli.py)**: provider ordering, `--provider`, `--no-fallback`, missing keys.
 - **[test_usage.py](tests/test_usage.py)**: thinking tokens billed as output, model-suffix price fallback, env overrides, unknown models.
 
 The real Gemini call isn't unit-tested (it needs a key and its output varies). That's what the one-week real-use check is for.
@@ -267,6 +304,8 @@ Run with: `pytest`
 | Streaming on by default | Immediate feedback; you can Ctrl+C a bad answer early. |
 | Status on stderr, result on stdout | `--json` output can be piped into other tools. |
 | `LLM` protocol + fake in tests | The retry/validation logic is tested without network or keys. |
+| Groq as automatic fallback | A different company's infrastructure, so a Gemini outage or quota limit doesn't block your commit. |
+| Fall back only after in-provider retries | Most invalid replies are fixed by one retry; switching provider is the last resort. |
 | Only staged changes (commit) / `base...HEAD` (PR) | Exactly what will be committed / exactly what the PR shows. |
 | Always ask before committing (unless `-y`) | AI output can be wrong; a human checks it. |
 | Exclude lockfiles; per-file truncation | Saves tokens; big files can't hide other changes. |
@@ -275,7 +314,7 @@ Run with: `pytest`
 
 ## 7. Privacy and cost
 
-- **Your diff is sent to Google.** Don't use the tool on code you aren't allowed to share with a third-party service, or on diffs containing secrets.
+- **Your diff is sent to Google**, and also to **Groq** if the fallback kicks in (only when `GROQ_API_KEY` is set). Don't use the tool on code you aren't allowed to share with a third-party service, or on diffs containing secrets.
 - On the free AI Studio tier, Google may use the data to improve its products; paid tiers have different terms.
 - The usage line after each call shows what that call cost on paid pricing. A typical commit is a few thousand input tokens, a fraction of a cent. `AICOMMIT_MAX_INPUT_TOKENS` caps the worst case.
 
@@ -292,7 +331,9 @@ Run with: `pytest`
 | Send bigger or smaller diffs | `AICOMMIT_MAX_INPUT_TOKENS` |
 | Fix cost estimates | `PRICES` in [usage.py](src/aicommit/usage.py), or `AICOMMIT_PRICE_INPUT`/`OUTPUT` |
 | Ignore more generated files | `EXCLUDED_PATHS` in [git.py](src/aicommit/git.py) |
-| Use a different AI provider | write a class with `count_tokens()` and `stream()` like `Gemini` in [ai.py](src/aicommit/ai.py) |
+| Use a different Groq model | `AICOMMIT_GROQ_MODEL=...` or `--groq-model`; add it to `GROQ_STRICT_MODELS` if Groq supports strict mode for it |
+| Try Groq first / disable fallback | `--provider groq` / `--no-fallback` |
+| Add another AI provider | write a class with `provider`, `model`, `price_env`, `count_tokens()` and `stream()` like `Groq` in [ai.py](src/aicommit/ai.py), then register it in `build_llms()` in [cli.py](src/aicommit/cli.py) |
 
 ---
 
@@ -308,7 +349,11 @@ Run with: `pytest`
 | `attempt 1 rejected: ...; retrying...` | The reply failed validation; the tool is retrying with the error. Occasional is fine. |
 | `Model output was invalid after 3 attempts` | Persistent failure; run with `--show-prompt` and check the model. Worth noting in your week of testing. |
 | `diff truncated to fit` | The diff exceeded the token budget; raise `AICOMMIT_MAX_INPUT_TOKENS` or commit in smaller pieces. |
-| `cost: unknown for <model>` | Model not in `PRICES`; set `AICOMMIT_PRICE_INPUT` / `AICOMMIT_PRICE_OUTPUT`. |
+| `cost: unknown for <model>` | Model not in `PRICES`; set the price env vars the message names. |
+| `gemini failed: ...` / `falling back to groq...` | Gemini errored or kept returning bad JSON; Groq answered instead. Nothing to do unless it happens every time. |
+| `Groq API error (400)` mentioning `json_schema` / `response_format` | That Groq model doesn't support structured outputs; use `qwen/qwen3.8-27b` or `openai/gpt-oss-20b`/`120b`. |
+| `All providers failed:` | Both failed; each provider's error is listed underneath. |
+| `--provider groq needs GROQ_API_KEY to be set` | Add the Groq key (see README setup). |
 | `No staged changes.` | Run `git add <files>` first, or use `aicommit -a`. |
 | `Could not detect a base branch` | Pass `--base main` (or whatever your PR targets). |
 | Want to see what the AI receives | `aicommit -d --show-prompt` |

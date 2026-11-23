@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterator, Protocol
 
 from aicommit import schema
-from aicommit.usage import Usage
+from aicommit.usage import GEMINI_PRICE_ENV, GROQ_PRICE_ENV, Usage
 
 _TYPES = ", ".join(schema.COMMIT_TYPES)
 
@@ -163,13 +163,17 @@ def fit_prompt(
 
 
 class AIError(Exception):
-    pass
+    def __init__(self, message: str, usage: Usage | None = None):
+        super().__init__(message)
+        self.usage = usage  # tokens already spent before failing (for cost reporting)
 
 
 class LLM(Protocol):
     """What the rest of the code needs from a model. Lets tests plug in a fake."""
 
+    provider: str       # "gemini", "groq", ... (for messages)
     model: str
+    price_env: str      # env var prefix for price overrides, e.g. "AICOMMIT_PRICE"
 
     def count_tokens(self, text: str) -> int: ...
 
@@ -179,6 +183,9 @@ class LLM(Protocol):
 
 
 class Gemini:
+    provider = "gemini"
+    price_env = GEMINI_PRICE_ENV
+
     def __init__(self, api_key: str, model: str):
         # Imported lazily so `--help` stays fast.
         from google import genai
@@ -212,6 +219,84 @@ class Gemini:
                 yield (chunk.text or ""), (Usage.from_metadata(meta) if meta else None)
         except errors.APIError as e:
             raise AIError(f"Gemini API error ({e.code}): {e.message}") from e
+        except Exception as e:  # network errors etc.; surfaced as AIError so fallback can kick in
+            raise AIError(f"Gemini request failed: {e}") from e
+
+
+# Groq models whose structured output uses constrained decoding (strict mode). Others get
+# best-effort json_schema. See https://console.groq.com/docs/structured-outputs
+GROQ_STRICT_MODELS = {
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "meta-models/muse-spark-open",
+}
+
+
+class Groq:
+    """Groq's OpenAI-style chat API.
+
+    Groq doesn't support streaming together with structured outputs, so this makes one
+    normal request and yields the whole reply as a single chunk.
+    """
+
+    provider = "groq"
+    price_env = GROQ_PRICE_ENV
+
+    def __init__(self, api_key: str, model: str, client: object | None = None):
+        self.model = model
+        if client is None:
+            import groq
+
+            client = groq.Groq(api_key=api_key)
+        self._client = client
+
+    def count_tokens(self, text: str) -> int:
+        # Groq has no token-counting endpoint; ~3 chars/token is a safe guess for code.
+        return len(text) // 3
+
+    def stream(self, system: str, prompt: str, temperature: float) -> Iterator[tuple[str, Usage | None]]:
+        import groq
+
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "generated_message",
+                        "strict": self.model in GROQ_STRICT_MODELS,
+                        "schema": schema.portable_json_schema(),
+                    },
+                },
+            )
+        except groq.APIStatusError as e:
+            raise AIError(f"Groq API error ({e.status_code}): {e.message}") from e
+        except groq.APIError as e:
+            raise AIError(f"Groq request failed: {e.message}") from e
+
+        text = (response.choices[0].message.content or "") if response.choices else ""
+        yield text, _groq_usage(getattr(response, "usage", None))
+
+
+def _groq_usage(u: object | None) -> Usage:
+    if u is None:
+        return Usage(calls=1)
+    completion = getattr(u, "completion_tokens", 0) or 0
+    details = getattr(u, "completion_tokens_details", None)
+    reasoning = (getattr(details, "reasoning_tokens", 0) or 0) if details else 0
+    # completion_tokens includes reasoning tokens; split them so thinking is shown separately.
+    return Usage(
+        input_tokens=getattr(u, "prompt_tokens", 0) or 0,
+        output_tokens=max(completion - reasoning, 0),
+        thinking_tokens=reasoning,
+        calls=1,
+    )
 
 
 @dataclass
@@ -219,6 +304,9 @@ class Result:
     message: schema.GeneratedMessage
     usage: Usage
     attempts: int
+    provider: str = ""
+    model: str = ""
+    price_env: str = GEMINI_PRICE_ENV
 
 
 def generate(
@@ -237,13 +325,17 @@ def generate(
     for attempt in range(1, max_attempts + 1):
         text_parts: list[str] = []
         usage: Usage | None = None
-        for text, chunk_usage in llm.stream(system, current_prompt, temperature):
-            if text:
-                text_parts.append(text)
-                if on_chunk:
-                    on_chunk(text)
-            if chunk_usage is not None:
-                usage = chunk_usage  # each report is cumulative; keep the latest
+        try:
+            for text, chunk_usage in llm.stream(system, current_prompt, temperature):
+                if text:
+                    text_parts.append(text)
+                    if on_chunk:
+                        on_chunk(text)
+                if chunk_usage is not None:
+                    usage = chunk_usage  # each report is cumulative; keep the latest
+        except AIError as e:
+            e.usage = total
+            raise
         total = total + (usage or Usage(calls=1))
 
         raw = "".join(text_parts)
@@ -251,7 +343,9 @@ def generate(
             last_error = "empty response (it may have been blocked by safety filters)"
         else:
             try:
-                return Result(schema.parse(raw), total, attempt)
+                return Result(schema.parse(raw), total, attempt,
+                              getattr(llm, "provider", ""), llm.model,
+                              getattr(llm, "price_env", GEMINI_PRICE_ENV))
             except schema.OutputInvalid as e:
                 last_error = str(e)
 
@@ -263,4 +357,36 @@ def generate(
                 "Reply again with ONLY a JSON object matching the schema."
             )
 
-    raise AIError(f"Model output was invalid after {max_attempts} attempts: {last_error}")
+    raise AIError(f"Model output was invalid after {max_attempts} attempts: {last_error}", total)
+
+
+def generate_with_fallback(
+    llms: list[LLM],
+    system: str,
+    prompt: str,
+    temperature: float = 0.4,
+    on_chunk: Callable[[str], None] | None = None,
+    on_retry: Callable[[int, str], None] | None = None,
+    on_start: Callable[[LLM], None] | None = None,
+    on_fallback: Callable[[LLM, AIError, LLM], None] | None = None,
+    max_attempts: int = 3,
+) -> Result:
+    """Try each model in order; move to the next if one errors or keeps returning bad JSON."""
+    if not llms:
+        raise AIError("No model configured")
+    failures: list[str] = []
+    for i, llm in enumerate(llms):
+        if on_start:
+            on_start(llm)
+        try:
+            return generate(llm, system, prompt, temperature, on_chunk, on_retry, max_attempts)
+        except AIError as e:
+            failures.append(f"{llm.provider}: {e}")
+            if i + 1 < len(llms):
+                if on_fallback:
+                    on_fallback(llm, e, llms[i + 1])
+                continue
+            if len(llms) == 1:
+                raise
+            raise AIError("All providers failed:\n  " + "\n  ".join(failures)) from e
+    raise AssertionError("unreachable")

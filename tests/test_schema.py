@@ -54,3 +54,13 @@ def test_json_schema_shape():
     assert set(s["required"]) == {"title", "summary", "type"}
     assert s["properties"]["type"]["enum"] == list(COMMIT_TYPES)
     assert s["additionalProperties"] is False
+
+
+def test_portable_schema_drops_unsupported_keywords_but_keeps_fields():
+    from aicommit.schema import portable_json_schema
+    s = portable_json_schema()
+    assert set(s["properties"]) == {"title", "summary", "type"}  # the *field* named title stays
+    dumped = json.dumps(s)
+    assert "maxLength" not in dumped and "minLength" not in dumped
+    assert "title" not in s and "title" not in s["properties"]["summary"]
+    assert s["additionalProperties"] is False

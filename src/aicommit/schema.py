@@ -68,6 +68,28 @@ def json_schema() -> dict:
     return GeneratedMessage.model_json_schema()
 
 
+# Keywords some providers' strict modes don't document. Dropping them only loosens what the
+# API enforces; parse() still checks lengths locally, so nothing invalid gets through.
+_NON_PORTABLE_KEYS = {"title", "minLength", "maxLength"}
+
+
+def portable_json_schema() -> dict:
+    """The same schema reduced to the core keywords strict modes support (used for Groq)."""
+
+    def strip(node: object) -> object:
+        if isinstance(node, dict):
+            return {
+                k: (strip(v) if k != "properties" else {name: strip(p) for name, p in v.items()})
+                for k, v in node.items()
+                if k not in _NON_PORTABLE_KEYS
+            }
+        if isinstance(node, list):
+            return [strip(v) for v in node]
+        return node
+
+    return strip(json_schema())  # type: ignore[return-value]
+
+
 class OutputInvalid(Exception):
     """The model's reply wasn't valid JSON or didn't match the schema."""
 

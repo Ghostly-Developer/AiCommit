@@ -5,11 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aicommit"
 version = "0.1.0"
-description = "Generate commit messages and PR descriptions as validated JSON from your git diff using Google AI Studio (Gemini)."
+description = "Generate commit messages and PR descriptions as validated JSON from your git diff using Google AI Studio (Gemini), with Groq as a fallback."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "google-genai>=1.30.0",
+    "groq>=1.0.0",
     "pydantic>=2.0",
     "python-dotenv>=1.0.0",
 ]

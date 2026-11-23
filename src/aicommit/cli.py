@@ -7,8 +7,10 @@ import os
 import sys
 
 from aicommit import __version__, ai, git, schema
-from aicommit.config import DEFAULT_MODEL, ConfigError, load_config
+from aicommit.config import DEFAULT_GROQ_MODEL, DEFAULT_MODEL, Config, ConfigError, load_config
 from aicommit.usage import format_usage
+
+PROVIDERS = ("gemini", "groq")
 
 # --- tiny colour helpers (no extra dependency) -----------------------------
 # Status/progress goes to stderr so `--json` leaves stdout as pure JSON.
@@ -40,7 +42,8 @@ def status(*args: object) -> None:
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="aicommit",
-        description="Generate a commit message or PR description for your changes with Google Gemini. "
+        description="Generate a commit message or PR description for your changes with Google Gemini "
+        "(falling back to Groq if Gemini fails). "
         "The model returns JSON {title, summary, type}, validated against a schema.",
     )
     p.add_argument("--pr", action="store_true",
@@ -63,7 +66,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                    help="commit with the subject line only, no body")
     p.add_argument("--no-stream", action="store_true",
                    help="don't show the response as it streams in")
+    p.add_argument("--provider", choices=PROVIDERS,
+                   help="provider to try first (default: gemini, falling back to groq)")
+    p.add_argument("--no-fallback", action="store_true",
+                   help="use only the first provider; don't fall back to the other one if it fails")
     p.add_argument("--model", help=f"Gemini model to use (default: $AICOMMIT_MODEL or {DEFAULT_MODEL})")
+    p.add_argument("--groq-model",
+                   help=f"Groq model to use (default: $AICOMMIT_GROQ_MODEL or {DEFAULT_GROQ_MODEL})")
     p.add_argument("--show-prompt", action="store_true",
                    help="print the prompt sent to the model (for debugging)")
     p.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
@@ -96,16 +105,44 @@ def ask_action() -> str:
             return "n"
 
 
-def _streamer(enabled: bool):
-    """Return an on_chunk callback that echoes streamed text to stderr, or None."""
-    if not enabled:
-        return None
+class Streamer:
+    """Echoes streamed text to stderr and remembers whether a line is left open."""
 
-    def on_chunk(text: str) -> None:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self._open_line = False
+
+    def __call__(self, text: str) -> None:
         sys.stderr.write(dim(text))
         sys.stderr.flush()
+        self._open_line = not text.endswith("\n")
 
-    return on_chunk
+    def end_line(self) -> None:
+        if self._open_line:
+            sys.stderr.write("\n")
+            self._open_line = False
+
+    @property
+    def callback(self):
+        return self if self.enabled else None
+
+
+def build_llms(config: Config, provider: str | None, fallback: bool) -> list[ai.LLM]:
+    """The providers to try, in order, limited to those with an API key."""
+    makers = {
+        "gemini": (config.gemini_api_key, "GEMINI_API_KEY",
+                   lambda: ai.Gemini(config.gemini_api_key, config.model)),
+        "groq": (config.groq_api_key, "GROQ_API_KEY",
+                 lambda: ai.Groq(config.groq_api_key, config.groq_model)),
+    }
+    if provider and not makers[provider][0]:
+        raise ConfigError(f"--provider {provider} needs {makers[provider][1]} to be set")
+    order = [provider] if provider else []
+    order += [p for p in PROVIDERS if p not in order]
+    available = [p for p in order if makers[p][0]]
+    if not fallback:
+        available = available[:1]
+    return [makers[p][2]() for p in available]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         git.ensure_repo()
-        config = load_config(args.model)
+        config = load_config(args.model, args.groq_model)
 
         if args.pr:
             base = args.base or git.default_base_branch()
@@ -142,10 +179,11 @@ def main(argv: list[str] | None = None) -> int:
             def build(diff: str) -> str:
                 return ai.build_prompt(diff, files, branch, recent, args.hint, args.commit_type)
 
-        llm = ai.Gemini(config.api_key, config.model)
+        llms = build_llms(config, args.provider, fallback=not args.no_fallback)
+        status(dim("providers: " + " -> ".join(f"{m.provider} ({m.model})" for m in llms)))
 
         # Context budget: make sure the request fits before paying for it.
-        fitted = ai.fit_prompt(build, raw_diff, system, config.max_input_tokens, llm.count_tokens)
+        fitted = ai.fit_prompt(build, raw_diff, system, config.max_input_tokens, llms[0].count_tokens)
         approx = "" if fitted.exact else "~"
         note = f"prompt: {approx}{fitted.tokens:,} tokens (limit {config.max_input_tokens:,})"
         if fitted.truncated:
@@ -159,20 +197,32 @@ def main(argv: list[str] | None = None) -> int:
             status(fitted.text)
             status(dim("------------------"))
 
-        stream = not args.no_stream and sys.stderr.isatty()
+        streamer = Streamer(not args.no_stream and sys.stderr.isatty())
+        what = "PR description" if args.pr else "commit message"
+
+        def on_start(llm: ai.LLM) -> None:
+            status(dim(f"Generating {what} with {llm.provider} ({llm.model})..."))
+
+        def on_retry(n: int, err: str) -> None:
+            streamer.end_line()
+            status(yellow(f"attempt {n} rejected: {err}; retrying..."))
+
+        def on_fallback(failed: ai.LLM, err: ai.AIError, nxt: ai.LLM) -> None:
+            streamer.end_line()
+            status(yellow(f"{failed.provider} failed: {err}"))
+            if err.usage and err.usage.calls:
+                status(dim(f"{failed.provider} " + format_usage(err.usage, failed.model, failed.price_env)))
+            status(yellow(f"falling back to {nxt.provider}..."))
+
         temperature = 0.4
         while True:
-            status(dim(f"Generating {'PR description' if args.pr else 'commit message'} with {config.model}..."))
-            result = ai.generate(
-                llm, system, fitted.text, temperature,
-                on_chunk=_streamer(stream),
-                on_retry=lambda n, err: status(
-                    ("\n" if stream else "") + yellow(f"attempt {n} rejected: {err}; retrying...")
-                ),
+            result = ai.generate_with_fallback(
+                llms, system, fitted.text, temperature,
+                on_chunk=streamer.callback, on_retry=on_retry,
+                on_start=on_start, on_fallback=on_fallback,
             )
-            if stream:
-                status()
-            status(dim(format_usage(result.usage, config.model)))
+            streamer.end_line()
+            status(dim(format_usage(result.usage, result.model, result.price_env)))
             msg = result.message
 
             if args.json:

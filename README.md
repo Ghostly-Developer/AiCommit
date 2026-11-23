@@ -6,9 +6,13 @@ The model returns structured JSON, `{"title", "summary", "type"}` with `type` on
 That JSON is constrained by a schema on the API side **and** validated locally, and the tool retries with feedback
 if a reply is invalid. Responses stream as they're generated, and every call reports its token usage and estimated cost.
 
+If Gemini fails (API error, rate limit, outage, or invalid JSON 3 times in a row), the tool falls back to **Groq**
+automatically when a Groq key is set.
+
 ## Setup
 
 1. Get an API key at <https://aistudio.google.com/apikey>.
+   Optional: also get a Groq key at <https://console.groq.com/keys> to enable the fallback.
 2. Install (from this folder):
 
    ```powershell
@@ -22,7 +26,7 @@ if a reply is invalid. Responses stream as they're generated, and every call rep
 
 3. Save your key. Pick one:
    - **Global (recommended):** create `~/.aicommit.env` (`C:\Users\<you>\.aicommit.env` on Windows) containing
-     `GEMINI_API_KEY=your-key`
+     `GEMINI_API_KEY=your-key` (and, optionally, `GROQ_API_KEY=your-groq-key` on its own line)
    - **Environment variable:** `setx GEMINI_API_KEY "your-key"` (Windows, restart terminal after) or `export GEMINI_API_KEY=...`
    - **Per-project:** copy `.env.example` to `.env` in the repo you run it from (`.env` is git-ignored).
 
@@ -88,22 +92,46 @@ With `gh`: `gh pr create --title "$(aicommit --pr --json | jq -r '.type + ": " +
 | `-t`, `--type fix` | Force the type (`feat`, `fix` or `refactor`) |
 | `-1`, `--one-line` | Commit with the subject line only |
 | `--no-stream` | Don't echo the response while it streams |
+| `--provider gemini\|groq` | Which provider to try first (default: `gemini`) |
+| `--no-fallback` | Use only the first provider; don't fall back if it fails |
 | `--model NAME` | Override the Gemini model |
+| `--groq-model NAME` | Override the Groq model |
 | `--show-prompt` | Print the system and user prompts that are sent |
 
 You can also run it as `python -m aicommit`.
+
+### Groq fallback
+
+With both keys set, a run looks like this when Gemini is down:
+
+```
+providers: gemini (gemini-3.8-flash) -> groq (qwen/qwen3.8-27b)
+Generating commit message with gemini (gemini-3.8-flash)...
+gemini failed: Gemini API error (503): The model is overloaded.
+falling back to groq...
+Generating commit message with groq (qwen/qwen3.8-27b)...
+tokens: 1,310 in / 74 out / 212 thinking | est. cost $0.00219
+```
+
+- Fallback happens on any Gemini API/network error, or when Gemini returns invalid JSON 3 times.
+- Groq uses the same schema (in **strict** mode for the default `qwen/qwen3.8-27b` and `openai/gpt-oss-20b`/`120b`, best-effort for other models), and the reply is validated locally just the same.
+- Groq doesn't support streaming together with structured output, so its reply appears all at once.
+- With only a Groq key set, Groq is used on its own. `aicommit --provider groq` tries Groq first.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | — | Google AI Studio key (required) |
-| `AICOMMIT_MODEL` | `gemini-3.8-flash` | Model name |
+| `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | — | Google AI Studio key |
+| `GROQ_API_KEY` | — | Groq key; enables the fallback (at least one of the two keys is required) |
+| `AICOMMIT_MODEL` | `gemini-3.8-flash` | Gemini model |
+| `AICOMMIT_GROQ_MODEL` | `qwen/qwen3.8-27b` | Groq model |
 | `AICOMMIT_MAX_INPUT_TOKENS` | `16000` | Input token budget per request; large diffs are trimmed per file to fit |
-| `AICOMMIT_PRICE_INPUT` / `AICOMMIT_PRICE_OUTPUT` | built-in table | USD per 1M tokens, for the cost estimate |
+| `AICOMMIT_PRICE_INPUT` / `AICOMMIT_PRICE_OUTPUT` | built-in table | Gemini USD per 1M tokens, for the cost estimate |
+| `AICOMMIT_GROQ_PRICE_INPUT` / `AICOMMIT_GROQ_PRICE_OUTPUT` | built-in table | Same, for Groq |
 
 Lockfiles (`package-lock.json`, `poetry.lock`, etc.) are excluded from the diff sent to the model.
-Cost estimates assume paid-tier pricing; the free AI Studio tier costs $0.
+Cost estimates assume paid-tier pricing; free tiers cost $0.
 
 ## Development
 
@@ -117,7 +145,7 @@ Layout:
 
 - `src/aicommit/cli.py`: argument parsing and the interactive loop
 - `src/aicommit/git.py`: git commands (staged diff, branch diff for PRs, log, commit)
-- `src/aicommit/ai.py`: prompts, token budgeting, streaming Gemini call, validate-and-retry
+- `src/aicommit/ai.py`: prompts, token budgeting, Gemini (streaming) and Groq clients, validate-and-retry, provider fallback
 - `src/aicommit/schema.py`: the `{title, summary, type}` schema and its validation
 - `src/aicommit/usage.py`: token usage and cost estimates
 - `src/aicommit/config.py`: API key and settings loading

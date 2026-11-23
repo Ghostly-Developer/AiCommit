@@ -12,12 +12,13 @@ VALID = json.dumps({"title": "add retry to upload", "summary": "- retry on 503",
 class FakeLLM:
     """Replays canned replies, streamed in small chunks, and records the prompts it got."""
 
-    model = "fake"
+    price_env = "AICOMMIT_PRICE"
 
-    def __init__(self, replies, tokens_per_char=0.25):
-        self.replies = list(replies)
+    def __init__(self, replies, tokens_per_char=0.25, provider="fake", model="fake-model"):
+        self.replies = list(replies)  # str = reply text, Exception = raised by the API call
         self.prompts: list[str] = []
         self.tokens_per_char = tokens_per_char
+        self.provider, self.model = provider, model
 
     def count_tokens(self, text: str) -> int:
         return int(len(text) * self.tokens_per_char)
@@ -25,6 +26,8 @@ class FakeLLM:
     def stream(self, system, prompt, temperature):
         self.prompts.append(prompt)
         reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
         for i in range(0, len(reply), 5):
             yield reply[i:i + 5], None
         yield "", Usage(input_tokens=100, output_tokens=20, thinking_tokens=5, calls=1)
@@ -110,3 +113,82 @@ def test_build_pr_prompt_includes_commits_and_base():
 def test_system_prompts_list_allowed_types():
     for prompt in (ai.COMMIT_SYSTEM_PROMPT, ai.PR_SYSTEM_PROMPT):
         assert "feat, fix, refactor" in prompt
+
+
+# --- provider fallback --------------------------------------------------------
+
+def test_fallback_on_api_error():
+    gemini = FakeLLM([ai.AIError("Gemini API error (429): quota")], provider="gemini")
+    groq = FakeLLM([VALID], provider="groq", model="openai/gpt-oss-20b")
+    events = []
+    result = ai.generate_with_fallback(
+        [gemini, groq], "sys", "prompt",
+        on_start=lambda llm: events.append(("start", llm.provider)),
+        on_fallback=lambda f, e, n: events.append(("fallback", f.provider, n.provider)),
+    )
+    assert result.provider == "groq" and result.model == "openai/gpt-oss-20b"
+    assert result.message.type == "feat"
+    assert events == [("start", "gemini"), ("fallback", "gemini", "groq"), ("start", "groq")]
+
+
+def test_fallback_after_repeated_invalid_json_reports_spent_usage():
+    gemini = FakeLLM(["nope", "nope", "nope"], provider="gemini")
+    groq = FakeLLM([VALID], provider="groq")
+    failed = []
+    result = ai.generate_with_fallback([gemini, groq], "sys", "prompt",
+                                       on_fallback=lambda f, e, n: failed.append(e))
+    assert result.provider == "groq"
+    assert failed[0].usage.calls == 3  # the tokens Gemini burned are still reported
+
+
+def test_no_fallback_when_primary_succeeds():
+    groq = FakeLLM([], provider="groq")
+    result = ai.generate_with_fallback([FakeLLM([VALID], provider="gemini"), groq], "sys", "p")
+    assert result.provider == "gemini" and groq.prompts == []
+
+
+def test_all_providers_failing_lists_every_error():
+    llms = [FakeLLM([ai.AIError("boom")], provider="gemini"),
+            FakeLLM([ai.AIError("bang")], provider="groq")]
+    with pytest.raises(ai.AIError, match="(?s)All providers failed.*gemini: boom.*groq: bang"):
+        ai.generate_with_fallback(llms, "sys", "p")
+
+
+def test_single_provider_error_is_raised_unchanged():
+    with pytest.raises(ai.AIError, match="^boom$"):
+        ai.generate_with_fallback([FakeLLM([ai.AIError("boom")])], "sys", "p")
+
+
+# --- Groq request/response handling (fake SDK client) -------------------------
+
+class _FakeGroqClient:
+    def __init__(self, content):
+        from types import SimpleNamespace as NS
+        self.kwargs = None
+        usage = NS(prompt_tokens=200, completion_tokens=90,
+                   completion_tokens_details=NS(reasoning_tokens=60))
+        self._response = NS(choices=[NS(message=NS(content=content))], usage=usage)
+        self.chat = NS(completions=NS(create=self._create))
+
+    def _create(self, **kwargs):
+        self.kwargs = kwargs
+        return self._response
+
+
+def test_groq_sends_strict_schema_and_splits_reasoning_tokens():
+    client = _FakeGroqClient(VALID)
+    llm = ai.Groq("key", "openai/gpt-oss-20b", client=client)
+    result = ai.generate(llm, "SYS", "PROMPT")
+    assert result.message.title == "add retry to upload"
+    assert result.usage.input_tokens == 200
+    assert result.usage.output_tokens == 30 and result.usage.thinking_tokens == 60
+    fmt = client.kwargs["response_format"]
+    assert fmt["type"] == "json_schema" and fmt["json_schema"]["strict"] is True
+    assert set(fmt["json_schema"]["schema"]["required"]) == {"title", "summary", "type"}
+    assert client.kwargs["messages"][0] == {"role": "system", "content": "SYS"}
+
+
+def test_groq_non_strict_model_uses_best_effort():
+    client = _FakeGroqClient(VALID)
+    ai.generate(ai.Groq("key", "some/other-model", client=client), "s", "p")
+    assert client.kwargs["response_format"]["json_schema"]["strict"] is False
