@@ -9,6 +9,8 @@ if a reply is invalid. Responses stream as they're generated, and every call rep
 If Gemini fails (API error, rate limit, outage, or invalid JSON 3 times in a row), the tool falls back to **Groq**
 automatically when a Groq key is set.
 
+New here? [USAGE.md](USAGE.md) walks through setup and day-to-day use step by step.
+
 ## Setup
 
 1. Get an API key at <https://aistudio.google.com/apikey>.
