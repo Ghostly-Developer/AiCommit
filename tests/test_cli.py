@@ -12,8 +12,8 @@ def cfg(gemini="g-key", groq="q-key"):
 @pytest.fixture(autouse=True)
 def fake_clients(monkeypatch):
     # Avoid constructing real SDK clients.
-    monkeypatch.setattr(ai.Gemini, "__init__", lambda self, key, model: setattr(self, "model", model))
-    monkeypatch.setattr(ai.Groq, "__init__", lambda self, key, model, client=None: setattr(self, "model", model))
+    monkeypatch.setattr(ai.Gemini, "__init__", lambda self, key, model, **kw: setattr(self, "model", model))
+    monkeypatch.setattr(ai.Groq, "__init__", lambda self, key, model, **kw: setattr(self, "model", model))
 
 
 def providers(llms):
@@ -40,3 +40,13 @@ def test_missing_keys_are_skipped():
 def test_explicit_provider_without_key_errors():
     with pytest.raises(ConfigError, match="GROQ_API_KEY"):
         build_llms(cfg(groq=None), "groq", fallback=True)
+
+
+def test_each_provider_gets_its_own_budget(monkeypatch):
+    monkeypatch.setattr(ai.Gemini, "__init__",
+                        lambda self, key, model, max_input_tokens: setattr(self, "budget", max_input_tokens))
+    monkeypatch.setattr(ai.Groq, "__init__",
+                        lambda self, key, model, max_input_tokens: setattr(self, "budget", max_input_tokens))
+    c = cfg()
+    c.groq_max_input_tokens = 5_000
+    assert [m.budget for m in build_llms(c, None, fallback=True)] == [16_000, 5_000]

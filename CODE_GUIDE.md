@@ -128,14 +128,15 @@ Only `ai.py` imports the AI SDKs: Google's inside the `Gemini` class and Groq's 
 ### 5.2 [config.py](src/aicommit/config.py): settings
 
 - `DEFAULT_MODEL = "gemini-3.8-flash"`: the Gemini model used if you don't choose one.
-- `DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"`: the Groq fallback model. It supports Groq's *strict* JSON-schema mode. Groq lists it as a preview model; `openai/gpt-oss-20b` is a much cheaper strict-mode alternative.
+- `DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"`: the Groq fallback model. It's cheap and supports Groq's *strict* JSON-schema mode.
+- `DEFAULT_GROQ_MAX_INPUT_TOKENS = 6_000`: Groq's separate prompt budget. Groq's free tier caps input tokens **per minute** per model (often 6-8k), and a single request over that cap is rejected outright with HTTP 413, so Groq needs a smaller budget than Gemini.
 - `DEFAULT_MAX_INPUT_TOKENS = 16_000`: the per-request input budget (system prompt + diff).
 - `USER_ENV_FILE`: `~/.aicommit.env`, a per-user file so one key works in every repo.
 
 **`load_config(model_override=None, groq_model_override=None) -> Config`**
 1. Loads `./.env` then `~/.aicommit.env`. `override=False` means already-set values win, so the priority is **real environment variable → `./.env` → `~/.aicommit.env`**.
 2. Reads `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) and `GROQ_API_KEY`. Each is optional, but at least one is required, otherwise it raises `ConfigError` with setup instructions.
-3. Parses `AICOMMIT_MAX_INPUT_TOKENS` (must be an integer ≥ 1000).
+3. Parses `AICOMMIT_MAX_INPUT_TOKENS` and `AICOMMIT_GROQ_MAX_INPUT_TOKENS` (integers ≥ 1000) with `_int_env()`.
 4. Picks the models: `--model` / `AICOMMIT_MODEL` / default for Gemini, and `--groq-model` / `AICOMMIT_GROQ_MODEL` / default for Groq.
 
 ### 5.3 [git.py](src/aicommit/git.py): talking to git
@@ -232,7 +233,7 @@ for chunk in client.models.generate_content_stream(model=..., contents=prompt, c
 **`class Groq`**: the fallback provider, with the same interface:
 ```python
 client.chat.completions.create(
-    model="qwen/qwen3.8-27b",
+    model="openai/gpt-oss-20b",
     messages=[{"role": "system", "content": system},   # OpenAI-style: the system prompt
               {"role": "user", "content": prompt}],     # is just the first message
     temperature=temperature,
@@ -244,7 +245,8 @@ client.chat.completions.create(
 ```
 - **Strict mode** (constrained decoding, which can't produce off-schema JSON) is only available on some Groq models, listed in `GROQ_STRICT_MODELS`. Other models get best-effort mode (`strict: False`). Local validation catches anything that slips through either way.
 - **No streaming:** Groq doesn't support streaming together with structured outputs, so `stream()` makes one normal request and yields the whole reply as a single chunk. Because the interface is the same, `generate()` doesn't need to know.
-- **`count_tokens`:** Groq has no counting endpoint, so it estimates ~3 characters per token.
+- **`count_tokens`:** Groq has no counting endpoint, so it estimates **pessimistically** at 2.5 characters per token: overshooting Groq's cap is a hard error, while undershooting only trims a little more diff than necessary.
+- **HTTP 413** ("Request too large ... Limit 7000, Requested 10301") becomes `RequestTooLarge`, with the `limit` and `requested` numbers parsed out of the message.
 - **Usage:** Groq's `completion_tokens` *includes* reasoning tokens. `_groq_usage()` splits them out so thinking is shown separately, just like Gemini's.
 - `groq.APIStatusError` / `groq.APIError` become `AIError`. The SDK itself already retries 429/5xx responses twice before giving up.
 
@@ -256,6 +258,8 @@ client.chat.completions.create(
 5. After `max_attempts` failures, raise `AIError`. The tool never prints or commits unvalidated output.
 
 **`generate_with_fallback(llms, ..., on_start, on_fallback) -> Result`**: tries each provider in order with `generate()`.
+- `prompt` can be a plain string or a function `prompt_for(llm, budget)`. The CLI passes a function, so **each provider gets a prompt trimmed to its own `max_input_tokens`** (16k for Gemini, 6k for Groq), built only when that provider is actually tried.
+- `_generate_within_limit()` wraps `generate()`: if the provider raises `RequestTooLarge` with a known limit, it rebuilds the prompt at 80% of that limit, calls `on_shrink`, and retries **once**. It also stores the new budget on the client so "regenerate" doesn't hit the same 413.
 - Success → return immediately. The `Result` records which `provider`/`model` answered, so usage and cost are priced correctly.
 - `AIError` (API error, network failure, or 3 invalid replies) → call `on_fallback(failed, error, next)` and try the next provider. Validation retries happen *within* a provider first; switching providers is the last resort.
 - If every provider fails, it raises one `AIError` listing each provider's error. With a single provider, the original error is raised unchanged.
@@ -269,7 +273,7 @@ client.chat.completions.create(
 - **`build_llms(config, provider, fallback)`** builds the ordered provider list: `--provider` first (default `gemini`), then the other. Providers without a key are skipped, and `--no-fallback` keeps only the first. Asking for `--provider groq` without `GROQ_API_KEY` is an error rather than a silent switch.
 - **`main()`**:
   1. Collects files/diff/context for commit mode or PR mode and picks the matching system prompt. `build` is a small closure that turns a (possibly trimmed) diff into the full user prompt; `fit_prompt` calls it repeatedly while trimming.
-  2. Builds the provider list (printed as `providers: gemini (...) -> groq (...)`) and fits the prompt to the token budget using the first provider's token counter.
+  2. Builds the provider list (printed as `providers: gemini (...) -> groq (...)`). `prompt_for(llm, budget)` fits the prompt to each provider's own budget with that provider's token counter, prints `prompt for groq: ~5,900 tokens (limit 6,000)`, and caches the result for regenerations.
   3. Generates with fallback (printing a warning, plus the failed provider's usage, when it switches), prints usage, then outputs JSON (`--json`), the PR markdown (`--pr`), or the commit message with the y/e/r/n prompt.
   4. "Regenerate" raises temperature by 0.3 (cap 1.5): with an identical prompt, more randomness is what produces a different answer.
   5. `GitError`, `ConfigError` and `AIError` are caught in one place and printed as `error: ...` without a traceback. Exit codes: 0 success, 1 error/aborted, 130 Ctrl+C.
@@ -351,8 +355,9 @@ Run with: `pytest`
 | `diff truncated to fit` | The diff exceeded the token budget; raise `AICOMMIT_MAX_INPUT_TOKENS` or commit in smaller pieces. |
 | `cost: unknown for <model>` | Model not in `PRICES`; set the price env vars the message names. |
 | `gemini failed: ...` / `falling back to groq...` | Gemini errored or kept returning bad JSON; Groq answered instead. Nothing to do unless it happens every time. |
-| `Groq API error (400)` mentioning `json_schema` / `response_format` | That Groq model doesn't support structured outputs; use `qwen/qwen3.8-27b` or `openai/gpt-oss-20b`/`120b`. |
+| `Groq API error (400)` mentioning `json_schema` / `response_format` | That Groq model doesn't support structured outputs; use `openai/gpt-oss-20b`/`120b` or `qwen/qwen3.8-27b`. |
 | `All providers failed:` | Both failed; each provider's error is listed underneath. |
+| `Groq API error (413): request too large ...; trimming the prompt` | The prompt exceeded Groq's input-tokens-per-minute cap; the tool trims and retries automatically. If it keeps happening, lower `AICOMMIT_GROQ_MAX_INPUT_TOKENS`. |
 | `--provider groq needs GROQ_API_KEY to be set` | Add the Groq key (see README setup). |
 | `No staged changes.` | Run `git add <files>` first, or use `aicommit -a`. |
 | `Could not detect a base branch` | Pass `--base main` (or whatever your PR targets). |

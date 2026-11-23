@@ -9,11 +9,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 DEFAULT_MODEL = "gemini-3.8-flash"
-# Groq fallback: a model with strict (constrained) JSON-schema output.
-DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
+# Groq fallback: a cheap model with strict (constrained) JSON-schema output.
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 # Cap on input tokens per request (system prompt + diff). A cost guard, well under the
 # model's real context window; large diffs are trimmed to fit.
 DEFAULT_MAX_INPUT_TOKENS = 16_000
+# Groq's free tier caps input tokens *per minute* per model (often 6-8k), and a single
+# request over that cap is rejected with HTTP 413. Stay under it by default.
+DEFAULT_GROQ_MAX_INPUT_TOKENS = 6_000
 
 # Global, per-user config file so the key works in every repository.
 USER_ENV_FILE = Path.home() / ".aicommit.env"
@@ -29,7 +32,19 @@ class Config:
     model: str                   # Gemini model
     groq_api_key: str | None
     groq_model: str
-    max_input_tokens: int
+    max_input_tokens: int        # Gemini prompt budget
+    groq_max_input_tokens: int = DEFAULT_GROQ_MAX_INPUT_TOKENS
+
+
+def _int_env(name: str, default: int, minimum: int = 1_000) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError(f"{name} must be an integer, got {raw!r}")
+    if value < minimum:
+        raise ConfigError(f"{name} must be at least {minimum}")
+    return value
 
 
 def load_config(model_override: str | None = None, groq_model_override: str | None = None) -> Config:
@@ -48,18 +63,11 @@ def load_config(model_override: str | None = None, groq_model_override: str | No
             "  - a .env file in the current directory"
         )
 
-    raw = os.getenv("AICOMMIT_MAX_INPUT_TOKENS", str(DEFAULT_MAX_INPUT_TOKENS))
-    try:
-        max_input_tokens = int(raw)
-    except ValueError:
-        raise ConfigError(f"AICOMMIT_MAX_INPUT_TOKENS must be an integer, got {raw!r}")
-    if max_input_tokens < 1_000:
-        raise ConfigError("AICOMMIT_MAX_INPUT_TOKENS must be at least 1000")
-
     return Config(
         gemini_api_key=gemini_key,
         model=model_override or os.getenv("AICOMMIT_MODEL") or DEFAULT_MODEL,
         groq_api_key=groq_key,
         groq_model=groq_model_override or os.getenv("AICOMMIT_GROQ_MODEL") or DEFAULT_GROQ_MODEL,
-        max_input_tokens=max_input_tokens,
+        max_input_tokens=_int_env("AICOMMIT_MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS),
+        groq_max_input_tokens=_int_env("AICOMMIT_GROQ_MAX_INPUT_TOKENS", DEFAULT_GROQ_MAX_INPUT_TOKENS),
     )

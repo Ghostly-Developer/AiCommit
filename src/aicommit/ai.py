@@ -168,12 +168,22 @@ class AIError(Exception):
         self.usage = usage  # tokens already spent before failing (for cost reporting)
 
 
+class RequestTooLarge(AIError):
+    """The provider rejected the prompt as too big (e.g. Groq's tokens-per-minute cap)."""
+
+    def __init__(self, message: str, limit: int | None = None, requested: int | None = None):
+        super().__init__(message)
+        self.limit = limit          # max input tokens the provider will accept, if it said
+        self.requested = requested  # what it counted for our request, if it said
+
+
 class LLM(Protocol):
     """What the rest of the code needs from a model. Lets tests plug in a fake."""
 
     provider: str       # "gemini", "groq", ... (for messages)
     model: str
     price_env: str      # env var prefix for price overrides, e.g. "AICOMMIT_PRICE"
+    max_input_tokens: int  # this provider's prompt budget (system + user prompt)
 
     def count_tokens(self, text: str) -> int: ...
 
@@ -186,11 +196,12 @@ class Gemini:
     provider = "gemini"
     price_env = GEMINI_PRICE_ENV
 
-    def __init__(self, api_key: str, model: str):
+    def __init__(self, api_key: str, model: str, max_input_tokens: int = 16_000):
         # Imported lazily so `--help` stays fast.
         from google import genai
 
         self.model = model
+        self.max_input_tokens = max_input_tokens
         self._client = genai.Client(api_key=api_key)
 
     def count_tokens(self, text: str) -> int:
@@ -243,8 +254,10 @@ class Groq:
     provider = "groq"
     price_env = GROQ_PRICE_ENV
 
-    def __init__(self, api_key: str, model: str, client: object | None = None):
+    def __init__(self, api_key: str, model: str, client: object | None = None,
+                 max_input_tokens: int = 6_000):
         self.model = model
+        self.max_input_tokens = max_input_tokens
         if client is None:
             import groq
 
@@ -252,8 +265,9 @@ class Groq:
         self._client = client
 
     def count_tokens(self, text: str) -> int:
-        # Groq has no token-counting endpoint; ~3 chars/token is a safe guess for code.
-        return len(text) // 3
+        # Groq has no token-counting endpoint. Code can be as dense as ~2.5 chars/token, so
+        # estimate pessimistically: overshooting Groq's per-minute token cap is a hard error.
+        return -(-len(text) * 2 // 5)  # ceil(len / 2.5)
 
     def stream(self, system: str, prompt: str, temperature: float) -> Iterator[tuple[str, Usage | None]]:
         import groq
@@ -276,12 +290,25 @@ class Groq:
                 },
             )
         except groq.APIStatusError as e:
+            if e.status_code == 413:
+                limit, requested = _parse_groq_limit(str(e.message))
+                raise RequestTooLarge(
+                    f"Groq API error (413): request too large for {self.model}"
+                    + (f" (limit {limit:,} input tokens/min, requested {requested:,})" if limit and requested else ""),
+                    limit, requested,
+                ) from e
             raise AIError(f"Groq API error ({e.status_code}): {e.message}") from e
         except groq.APIError as e:
             raise AIError(f"Groq request failed: {e.message}") from e
 
         text = (response.choices[0].message.content or "") if response.choices else ""
         yield text, _groq_usage(getattr(response, "usage", None))
+
+
+def _parse_groq_limit(message: str) -> tuple[int | None, int | None]:
+    """Pull 'Limit 7000, Requested 10301' out of Groq's 413 message."""
+    m = re.search(r"Limit\s+(\d+),\s*Requested\s+(\d+)", message)
+    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
 
 
 def _groq_usage(u: object | None) -> Usage:
@@ -360,18 +387,53 @@ def generate(
     raise AIError(f"Model output was invalid after {max_attempts} attempts: {last_error}", total)
 
 
+SHRINK_MARGIN = 0.8  # after a 413, aim for 80% of the limit the provider reported
+
+
+def _generate_within_limit(
+    llm: LLM,
+    system: str,
+    prompt: str | Callable[[LLM, int], str],
+    temperature: float,
+    on_chunk: Callable[[str], None] | None,
+    on_retry: Callable[[int, str], None] | None,
+    on_shrink: Callable[[LLM, RequestTooLarge, int], None] | None,
+    max_attempts: int,
+) -> Result:
+    """generate(), but if the provider says the prompt is too large, re-fit it once and retry."""
+    budget = getattr(llm, "max_input_tokens", 0)
+    while True:
+        text = prompt(llm, budget) if callable(prompt) else prompt
+        try:
+            return generate(llm, system, text, temperature, on_chunk, on_retry, max_attempts)
+        except RequestTooLarge as e:
+            new_budget = int(e.limit * SHRINK_MARGIN) if e.limit else 0
+            # Give up if we can't rebuild the prompt, don't know the limit, or already shrank.
+            if not callable(prompt) or not new_budget or (budget and new_budget >= budget):
+                raise
+            budget = new_budget
+            llm.max_input_tokens = budget  # remember for regenerations in this run
+            if on_shrink:
+                on_shrink(llm, e, budget)
+
+
 def generate_with_fallback(
     llms: list[LLM],
     system: str,
-    prompt: str,
+    prompt: str | Callable[[LLM, int], str],
     temperature: float = 0.4,
     on_chunk: Callable[[str], None] | None = None,
     on_retry: Callable[[int, str], None] | None = None,
     on_start: Callable[[LLM], None] | None = None,
     on_fallback: Callable[[LLM, AIError, LLM], None] | None = None,
+    on_shrink: Callable[[LLM, RequestTooLarge, int], None] | None = None,
     max_attempts: int = 3,
 ) -> Result:
-    """Try each model in order; move to the next if one errors or keeps returning bad JSON."""
+    """Try each model in order; move to the next if one errors or keeps returning bad JSON.
+
+    `prompt` may be a function (llm, token_budget) -> prompt text, so each provider gets a
+    prompt sized to its own limit.
+    """
     if not llms:
         raise AIError("No model configured")
     failures: list[str] = []
@@ -379,7 +441,8 @@ def generate_with_fallback(
         if on_start:
             on_start(llm)
         try:
-            return generate(llm, system, prompt, temperature, on_chunk, on_retry, max_attempts)
+            return _generate_within_limit(llm, system, prompt, temperature, on_chunk, on_retry,
+                                          on_shrink, max_attempts)
         except AIError as e:
             failures.append(f"{llm.provider}: {e}")
             if i + 1 < len(llms):

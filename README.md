@@ -105,17 +105,18 @@ You can also run it as `python -m aicommit`.
 With both keys set, a run looks like this when Gemini is down:
 
 ```
-providers: gemini (gemini-3.8-flash) -> groq (qwen/qwen3.8-27b)
+providers: gemini (gemini-3.8-flash) -> groq (openai/gpt-oss-20b)
 Generating commit message with gemini (gemini-3.8-flash)...
 gemini failed: Gemini API error (503): The model is overloaded.
 falling back to groq...
-Generating commit message with groq (qwen/qwen3.8-27b)...
-tokens: 1,310 in / 74 out / 212 thinking | est. cost $0.00219
+Generating commit message with groq (openai/gpt-oss-20b)...
+tokens: 1,310 in / 74 out / 212 thinking | est. cost $0.00018
 ```
 
 - Fallback happens on any Gemini API/network error, or when Gemini returns invalid JSON 3 times.
-- Groq uses the same schema (in **strict** mode for the default `qwen/qwen3.8-27b` and `openai/gpt-oss-20b`/`120b`, best-effort for other models), and the reply is validated locally just the same.
+- Groq uses the same schema (in **strict** mode for the default `openai/gpt-oss-20b`, plus `openai/gpt-oss-120b` and `qwen/qwen3.8-27b`; best-effort for other models), and the reply is validated locally just the same.
 - Groq doesn't support streaming together with structured output, so its reply appears all at once.
+- Groq gets its **own, smaller prompt budget** (`AICOMMIT_GROQ_MAX_INPUT_TOKENS`, default 6000), because its free tier rejects any single request over the model's input-tokens-per-minute cap (HTTP 413). If Groq still answers 413, the tool reads the limit from the error, trims the diff to 80% of it, and retries once.
 - With only a Groq key set, Groq is used on its own. `aicommit --provider groq` tries Groq first.
 
 ## Configuration
@@ -125,8 +126,9 @@ tokens: 1,310 in / 74 out / 212 thinking | est. cost $0.00219
 | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | — | Google AI Studio key |
 | `GROQ_API_KEY` | — | Groq key; enables the fallback (at least one of the two keys is required) |
 | `AICOMMIT_MODEL` | `gemini-3.8-flash` | Gemini model |
-| `AICOMMIT_GROQ_MODEL` | `qwen/qwen3.8-27b` | Groq model |
-| `AICOMMIT_MAX_INPUT_TOKENS` | `16000` | Input token budget per request; large diffs are trimmed per file to fit |
+| `AICOMMIT_GROQ_MODEL` | `openai/gpt-oss-20b` | Groq model |
+| `AICOMMIT_GROQ_MAX_INPUT_TOKENS` | `6000` | Groq prompt budget. Keep it under your Groq tier's input-tokens-per-minute limit |
+| `AICOMMIT_MAX_INPUT_TOKENS` | `16000` | Gemini input token budget per request; large diffs are trimmed per file to fit |
 | `AICOMMIT_PRICE_INPUT` / `AICOMMIT_PRICE_OUTPUT` | built-in table | Gemini USD per 1M tokens, for the cost estimate |
 | `AICOMMIT_GROQ_PRICE_INPUT` / `AICOMMIT_GROQ_PRICE_OUTPUT` | built-in table | Same, for Groq |
 

@@ -131,9 +131,11 @@ def build_llms(config: Config, provider: str | None, fallback: bool) -> list[ai.
     """The providers to try, in order, limited to those with an API key."""
     makers = {
         "gemini": (config.gemini_api_key, "GEMINI_API_KEY",
-                   lambda: ai.Gemini(config.gemini_api_key, config.model)),
+                   lambda: ai.Gemini(config.gemini_api_key, config.model,
+                                     max_input_tokens=config.max_input_tokens)),
         "groq": (config.groq_api_key, "GROQ_API_KEY",
-                 lambda: ai.Groq(config.groq_api_key, config.groq_model)),
+                 lambda: ai.Groq(config.groq_api_key, config.groq_model,
+                                 max_input_tokens=config.groq_max_input_tokens)),
     }
     if provider and not makers[provider][0]:
         raise ConfigError(f"--provider {provider} needs {makers[provider][1]} to be set")
@@ -182,20 +184,28 @@ def main(argv: list[str] | None = None) -> int:
         llms = build_llms(config, args.provider, fallback=not args.no_fallback)
         status(dim("providers: " + " -> ".join(f"{m.provider} ({m.model})" for m in llms)))
 
-        # Context budget: make sure the request fits before paying for it.
-        fitted = ai.fit_prompt(build, raw_diff, system, config.max_input_tokens, llms[0].count_tokens)
-        approx = "" if fitted.exact else "~"
-        note = f"prompt: {approx}{fitted.tokens:,} tokens (limit {config.max_input_tokens:,})"
-        if fitted.truncated:
-            note += yellow(" | diff truncated to fit")
-        status(dim(note))
-
+        # Context budget: each provider gets a prompt trimmed to its own token limit, built
+        # only when that provider is actually tried, and cached for regenerations.
+        fitted_cache: dict[tuple[str, int], str] = {}
         if args.show_prompt:
             status(dim("----- system -----"))
             status(system)
-            status(dim("----- prompt -----"))
-            status(fitted.text)
-            status(dim("------------------"))
+
+        def prompt_for(llm: ai.LLM, budget: int) -> str:
+            key = (llm.provider, budget)
+            if key not in fitted_cache:
+                fitted = ai.fit_prompt(build, raw_diff, system, budget, llm.count_tokens)
+                approx = "" if fitted.exact else "~"
+                note = f"prompt for {llm.provider}: {approx}{fitted.tokens:,} tokens (limit {budget:,})"
+                if fitted.truncated:
+                    note += yellow(" | diff truncated to fit")
+                status(dim(note))
+                if args.show_prompt:
+                    status(dim(f"----- prompt ({llm.provider}) -----"))
+                    status(fitted.text)
+                    status(dim("------------------"))
+                fitted_cache[key] = fitted.text
+            return fitted_cache[key]
 
         streamer = Streamer(not args.no_stream and sys.stderr.isatty())
         what = "PR description" if args.pr else "commit message"
@@ -214,12 +224,16 @@ def main(argv: list[str] | None = None) -> int:
                 status(dim(f"{failed.provider} " + format_usage(err.usage, failed.model, failed.price_env)))
             status(yellow(f"falling back to {nxt.provider}..."))
 
+        def on_shrink(llm: ai.LLM, err: ai.RequestTooLarge, budget: int) -> None:
+            streamer.end_line()
+            status(yellow(f"{err}; trimming the prompt to {budget:,} tokens and retrying..."))
+
         temperature = 0.4
         while True:
             result = ai.generate_with_fallback(
-                llms, system, fitted.text, temperature,
+                llms, system, prompt_for, temperature,
                 on_chunk=streamer.callback, on_retry=on_retry,
-                on_start=on_start, on_fallback=on_fallback,
+                on_start=on_start, on_fallback=on_fallback, on_shrink=on_shrink,
             )
             streamer.end_line()
             status(dim(format_usage(result.usage, result.model, result.price_env)))

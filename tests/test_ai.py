@@ -14,7 +14,9 @@ class FakeLLM:
 
     price_env = "AICOMMIT_PRICE"
 
-    def __init__(self, replies, tokens_per_char=0.25, provider="fake", model="fake-model"):
+    def __init__(self, replies, tokens_per_char=0.25, provider="fake", model="fake-model",
+                 max_input_tokens=16_000):
+        self.max_input_tokens = max_input_tokens
         self.replies = list(replies)  # str = reply text, Exception = raised by the API call
         self.prompts: list[str] = []
         self.tokens_per_char = tokens_per_char
@@ -192,3 +194,70 @@ def test_groq_non_strict_model_uses_best_effort():
     client = _FakeGroqClient(VALID)
     ai.generate(ai.Groq("key", "some/other-model", client=client), "s", "p")
     assert client.kwargs["response_format"]["json_schema"]["strict"] is False
+
+
+# --- per-provider token budgets / HTTP 413 ------------------------------------
+
+def test_each_provider_gets_a_prompt_for_its_own_budget():
+    gemini = FakeLLM([ai.AIError("down")], provider="gemini", max_input_tokens=16_000)
+    groq = FakeLLM([VALID], provider="groq", max_input_tokens=6_000)
+    asked = []
+
+    def prompt_for(llm, budget):
+        asked.append((llm.provider, budget))
+        return f"prompt<{budget}>"
+
+    ai.generate_with_fallback([gemini, groq], "sys", prompt_for)
+    assert asked == [("gemini", 16_000), ("groq", 6_000)]
+    assert groq.prompts == ["prompt<6000>"]
+
+
+def test_request_too_large_shrinks_prompt_and_retries_once():
+    too_big = ai.RequestTooLarge("413", limit=7000, requested=10301)
+    groq = FakeLLM([too_big, VALID], provider="groq", max_input_tokens=16_000)
+    shrinks = []
+    result = ai.generate_with_fallback([groq], "sys", lambda llm, b: f"p<{b}>",
+                                       on_shrink=lambda llm, e, b: shrinks.append(b))
+    assert result.provider == "groq"
+    assert shrinks == [5600]                          # 80% of the reported limit
+    assert groq.prompts == ["p<16000>", "p<5600>"]
+    assert groq.max_input_tokens == 5600              # remembered for regenerations
+
+
+def test_request_too_large_twice_gives_up():
+    errs = [ai.RequestTooLarge("413", limit=7000), ai.RequestTooLarge("413", limit=7000)]
+    with pytest.raises(ai.RequestTooLarge):
+        ai.generate_with_fallback([FakeLLM(errs, max_input_tokens=16_000)], "s", lambda l, b: "p")
+
+
+def test_request_too_large_with_fixed_prompt_is_not_retried():
+    llm = FakeLLM([ai.RequestTooLarge("413", limit=7000)])
+    with pytest.raises(ai.RequestTooLarge):
+        ai.generate_with_fallback([llm], "s", "fixed prompt")
+
+
+def test_groq_413_is_parsed_into_request_too_large():
+    import groq
+    import httpx
+
+    class Client413:
+        def __init__(self):
+            from types import SimpleNamespace as NS
+            self.chat = NS(completions=NS(create=self._create))
+
+        def _create(self, **kw):
+            resp = httpx.Response(413, request=httpx.Request("POST", "https://api.groq.com"))
+            raise groq.APIStatusError(
+                "Request too large for model `x` on input tokens per minute (ITPM): "
+                "Limit 7000, Requested 10301, please reduce your message size",
+                response=resp, body=None)
+
+    llm = ai.Groq("key", "openai/gpt-oss-20b", client=Client413())
+    with pytest.raises(ai.RequestTooLarge) as info:
+        ai.generate(llm, "s", "p")
+    assert (info.value.limit, info.value.requested) == (7000, 10301)
+    assert "limit 7,000" in str(info.value)
+
+
+def test_groq_token_estimate_is_pessimistic():
+    assert ai.Groq("k", "m", client=object()).count_tokens("x" * 1000) == 400
